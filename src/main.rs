@@ -64,10 +64,27 @@ enum Cmd {
         /// Who is running it (recorded in the run history)
         #[arg(long, default_value = "user")]
         by: String,
+        /// Run it apart from this terminal (its own session): it survives the shell or the agent that started it,
+        /// its output goes to the run's log (`cr tail`), `cr stop` ends it, and the registry records how it ended
+        #[arg(long)]
+        detach: bool,
+        /// (internal) the detached cr itself
+        #[arg(long, hide = true)]
+        daemon: bool,
         /// Extra arguments appended (shell-quoted) to the command
         #[arg(last = true)]
         extra: Vec<String>,
     },
+    /// Runs in progress: name, run id, pid, how long, log
+    Ps,
+    /// Stop a command's run in progress: SIGTERM to its process group, SIGKILL after --grace seconds
+    Stop {
+        name: String,
+        #[arg(long, default_value_t = 20)]
+        grace: u64,
+    },
+    /// Follow a command's latest run log (live while it runs)
+    Tail { name: String },
     /// List registered commands, most recently used first
     List {
         #[arg(long)]
@@ -141,7 +158,7 @@ fn real_main() -> Result<()> {
     let session = cli.session.filter(|s| !s.is_empty());
 
     match cli.cmd.unwrap_or(Cmd::Ui) {
-        Cmd::Ui => tui::run(Store::open(&db)?, session),
+        Cmd::Ui => tui::run(Store::open(&db)?, session, db.clone()),
         Cmd::Path => {
             println!("{}", db.display());
             Ok(())
@@ -212,15 +229,18 @@ fn real_main() -> Result<()> {
                 None => eprintln!("cr: registered {:?}", cmd.name),
             }
             if run {
-                let out = runner::run(&store, &cmd, &[], &by)?;
+                let out = runner::run(&store, &cmd, &[], &by, &db, false)?;
                 std::process::exit(out.exit_code.unwrap_or(1));
             }
             Ok(())
         }
-        Cmd::Run { name, by, extra } => {
+        Cmd::Run { name, by, detach, daemon, extra } => {
             let store = Store::open(&db)?;
             let cmd = store.require(&name)?;
-            let out = runner::run(&store, &cmd, &extra, &by)?;
+            if detach {
+                return detach_run(&store, &db, &cmd, &by, &extra);
+            }
+            let out = runner::run(&store, &cmd, &extra, &by, &db, daemon)?;
             if out.redactions > 0 {
                 eprintln!("cr: {} secret(s) redacted from the stored log", out.redactions);
             }
@@ -279,7 +299,7 @@ fn real_main() -> Result<()> {
                     println!(
                         "  {}  exit {:<4} {:>8}  by {}",
                         r.started_at.format("%Y-%m-%d %H:%M:%S"),
-                        r.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "sig".into()),
+                        if !r.finished { "RUN".into() } else { r.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "sig".into()) },
                         runner::fmt_duration(r.duration_ms),
                         r.by
                     );
@@ -302,6 +322,90 @@ fn real_main() -> Result<()> {
             Ok(())
         }
         Cmd::Session { cmd } => session_cmd(&Store::open(&db)?, cmd),
+        Cmd::Ps => {
+            let store = Store::open(&db)?;
+            let runs = store.unfinished_runs()?;
+            if runs.is_empty() {
+                println!("no runs in progress");
+            }
+            for (name, r) in runs {
+                let alive = r.pid.is_some_and(alive);
+                let ms = (chrono::Local::now() - r.started_at).num_milliseconds();
+                println!(
+                    "{} {:<28} run #{:<5} pid {:<8} pgid {:<8} {:>8}  by {:<7} {}",
+                    if alive { "●" } else { "?" },
+                    name,
+                    r.id,
+                    r.pid.map(|p| p.to_string()).unwrap_or_default(),
+                    r.pgid.map(|p| p.to_string()).unwrap_or_default(),
+                    runner::fmt_duration(ms),
+                    r.by,
+                    if alive {
+                        r.log_path.unwrap_or_default()
+                    } else {
+                        "LOST: its process is gone (cr died before recording the end)".into()
+                    }
+                );
+            }
+            Ok(())
+        }
+        Cmd::Stop { name, grace } => {
+            let store = Store::open(&db)?;
+            let cmd = store.require(&name)?;
+            let Some(r) = store.runs(cmd.id, 20, false)?.into_iter().find(|r| !r.finished) else {
+                bail!("{name:?} has no run in progress")
+            };
+            let (pid, pgid) = (r.pid.unwrap_or(0), r.pgid.unwrap_or(0));
+            if pgid <= 1 || pgid == unsafe { libc::getpgid(0) } as i64 {
+                bail!("run #{} has no process group of its own to stop (pgid {pgid})", r.id);
+            }
+            eprintln!("cr: SIGTERM to run #{} (pid {pid}, process group {pgid})", r.id);
+            unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGTERM) };
+            let t0 = std::time::Instant::now();
+            let mut killed = false;
+            let current = |store: &Store| -> Result<Option<store::Run>> {
+                Ok(store.runs(cmd.id, 50, false)?.into_iter().find(|x| x.id == r.id))
+            };
+            loop {
+                if current(&store)?.is_none_or(|x| x.finished) {
+                    break;
+                }
+                if !killed && t0.elapsed().as_secs() >= grace {
+                    eprintln!("cr: still running after {grace} s: SIGKILL to process group {pgid}");
+                    unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGKILL) };
+                    killed = true;
+                }
+                if killed && t0.elapsed().as_secs() >= grace + 10 {
+                    let ms = (chrono::Local::now() - r.started_at).num_milliseconds();
+                    store.finish_run(r.id, ms, None, "(stopped by cr stop; its cr never recorded the end)", false)?;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            if let Some(x) = current(&store)? {
+                eprintln!(
+                    "cr: run #{} ended: exit {} after {}",
+                    x.id,
+                    x.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+                    runner::fmt_duration(x.duration_ms)
+                );
+            }
+            Ok(())
+        }
+        Cmd::Tail { name } => {
+            let store = Store::open(&db)?;
+            let cmd = store.require(&name)?;
+            let Some(r) = store.runs(cmd.id, 1, false)?.into_iter().next() else { bail!("{name:?} has never run") };
+            let Some(log) = r.log_path else { bail!("run #{} predates run logs; see `cr log {name}`", r.id) };
+            let mut t = std::process::Command::new("tail");
+            t.arg("-n").arg("+1");
+            if !r.finished {
+                if let Some(p) = r.pid {
+                    t.arg("-f").arg(format!("--pid={p}"));
+                }
+            }
+            std::process::exit(t.arg(&log).status()?.code().unwrap_or(1));
+        }
         Cmd::Rm { name } => {
             let store = Store::open(&db)?;
             if !store.remove(&name)? {
@@ -311,6 +415,52 @@ fn real_main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn alive(pid: i64) -> bool {
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// `cr run --detach`: this same cr re-run with --daemon in a new session, apart from the caller's terminal and
+/// process group; prints the run it started once the registry has it.
+fn detach_run(store: &Store, db: &std::path::Path, cmd: &store::Command, by: &str, extra: &[String]) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let before = store.runs(cmd.id, 1, false)?.first().map(|r| r.id).unwrap_or(0);
+    let dir = runner::log_dir(db).join(&cmd.name);
+    std::fs::create_dir_all(&dir)?;
+    let daemon_log = dir.join(format!("daemon-{}.log", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+    let out = std::fs::File::create(&daemon_log)?;
+    let mut p = std::process::Command::new(std::env::current_exe()?);
+    p.arg("--db").arg(db).arg("run").arg(&cmd.name).arg("--by").arg(by).arg("--daemon");
+    if !extra.is_empty() {
+        p.arg("--").args(extra);
+    }
+    p.stdin(std::process::Stdio::null()).stdout(out.try_clone()?).stderr(out);
+    unsafe {
+        p.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let child = p.spawn()?;
+    for _ in 0..100 {
+        if let Some(r) = store.runs(cmd.id, 1, false)?.into_iter().next().filter(|r| r.id > before) {
+            println!(
+                "cr: {} detached as run #{} · cr pid {} · command pid {} pgid {}\n    log  {}\n    cr tail {}   cr stop {}   cr ps",
+                cmd.name,
+                r.id,
+                child.id(),
+                r.pid.unwrap_or(0),
+                r.pgid.unwrap_or(0),
+                r.log_path.unwrap_or_default(),
+                cmd.name,
+                cmd.name
+            );
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    bail!("the detached run did not start within 10 s; see {}", daemon_log.display())
 }
 
 fn session_cmd(store: &Store, cmd: SessionCmd) -> Result<()> {
@@ -376,7 +526,7 @@ fn session_cmd(store: &Store, cmd: SessionCmd) -> Result<()> {
                         "  {}  {:<28} exit {:<4} {:>8}  by {}",
                         r.started_at.format("%Y-%m-%d %H:%M:%S"),
                         cmd,
-                        r.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "sig".into()),
+                        if !r.finished { "RUN".into() } else { r.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "sig".into()) },
                         runner::fmt_duration(r.duration_ms),
                         r.by
                     );

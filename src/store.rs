@@ -55,6 +55,10 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("commands", "session_id", "INTEGER REFERENCES sessions(id) ON DELETE SET NULL"),
     ("runs", "session_id", "INTEGER REFERENCES sessions(id) ON DELETE SET NULL"),
     ("runs", "env_json", "TEXT NOT NULL DEFAULT '{}'"),
+    ("runs", "pid", "INTEGER"),
+    ("runs", "pgid", "INTEGER"),
+    ("runs", "log_path", "TEXT"),
+    ("runs", "finished", "INTEGER NOT NULL DEFAULT 1"),
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +109,13 @@ pub struct Run {
     pub truncated: bool,
     /// The session variables injected into this run (empty unless fetched with `runs`).
     pub env: BTreeMap<String, String>,
+    /// The command's shell process and the process group `cr stop` signals.
+    pub pid: Option<i64>,
+    pub pgid: Option<i64>,
+    /// Where the output is written as it runs (`cr tail`).
+    pub log_path: Option<String>,
+    /// False while it runs (or if its `cr` died before recording the end).
+    pub finished: bool,
 }
 
 /// What a caller supplies when registering a command (already sanitized).
@@ -121,17 +132,17 @@ pub struct NewCommand {
     pub session: Option<String>,
 }
 
+/// A run as it starts: recorded at once, finished by `finish_run`.
 pub struct NewRun {
     pub started_at: DateTime<Local>,
-    pub duration_ms: i64,
-    pub exit_code: Option<i32>,
     pub by: String,
     pub command_text: String,
     pub cwd: Option<String>,
-    pub output: String,
-    pub truncated: bool,
     pub session_id: Option<i64>,
     pub env: BTreeMap<String, String>,
+    pub pid: i64,
+    pub pgid: i64,
+    pub log_path: String,
 }
 
 pub struct Store {
@@ -159,7 +170,7 @@ const CMD_COLS: &str = "c.id, c.name, c.command, c.description, c.instructions, 
      c.tags, c.source, c.redacted, c.created_at, c.updated_at, \
      (SELECT COUNT(*) FROM runs x WHERE x.command_id = c.id), \
      r.id, r.started_at, r.duration_ms, r.exit_code, r.by, r.command_text, r.cwd, r.truncated, \
-     (SELECT name FROM sessions s WHERE s.id = c.session_id)";
+     (SELECT name FROM sessions s WHERE s.id = c.session_id), r.finished";
 
 const CMD_FROM: &str = "FROM commands c LEFT JOIN runs r ON r.id = \
      (SELECT id FROM runs WHERE command_id = c.id ORDER BY started_at DESC, id DESC LIMIT 1)";
@@ -179,6 +190,10 @@ fn command_from_row(row: &Row) -> rusqlite::Result<Command> {
             output: String::new(),
             truncated: row.get::<_, i64>(20)? != 0,
             env: BTreeMap::new(),
+            pid: None,
+            pgid: None,
+            log_path: None,
+            finished: row.get::<_, Option<i64>>(22)?.unwrap_or(1) != 0,
         }),
         None => None,
     };
@@ -201,9 +216,12 @@ fn command_from_row(row: &Row) -> rusqlite::Result<Command> {
     })
 }
 
-const RUN_COLS: &str = "r.id, r.started_at, r.duration_ms, r.exit_code, r.by, r.command_text, r.cwd";
+/// The run columns every run query reads first (0..=10); output, truncated, env_json follow at 11..=13.
+const RUN_COLS: &str =
+    "r.id, r.started_at, r.duration_ms, r.exit_code, r.by, r.command_text, r.cwd, r.pid, r.pgid, r.log_path, r.finished";
 
-fn run_from_row(row: &Row, output: String, truncated: bool, env_json: &str) -> rusqlite::Result<Run> {
+fn run_from_row(row: &Row) -> rusqlite::Result<Run> {
+    let env_json: String = row.get(13)?;
     Ok(Run {
         id: row.get(0)?,
         started_at: parse_ts(&row.get::<_, String>(1)?),
@@ -212,9 +230,13 @@ fn run_from_row(row: &Row, output: String, truncated: bool, env_json: &str) -> r
         by: row.get(4)?,
         command_text: row.get(5)?,
         cwd: row.get(6)?,
-        output,
-        truncated,
-        env: serde_json::from_str(env_json).unwrap_or_default(),
+        output: row.get(11)?,
+        truncated: row.get::<_, i64>(12)? != 0,
+        env: serde_json::from_str(&env_json).unwrap_or_default(),
+        pid: row.get(7)?,
+        pgid: row.get(8)?,
+        log_path: row.get(9)?,
+        finished: row.get::<_, i64>(10)? != 0,
     })
 }
 
@@ -304,25 +326,45 @@ impl Store {
         Ok(self.conn.execute("DELETE FROM commands WHERE name = ?1", [name])? > 0)
     }
 
-    pub fn record_run(&self, command_id: i64, r: &NewRun) -> Result<i64> {
+    /// Record a run the moment it starts (finished = 0); `finish_run` completes it.
+    pub fn start_run(&self, command_id: i64, r: &NewRun) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO runs (command_id, started_at, duration_ms, exit_code, by, command_text, cwd, output, truncated, session_id, env_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO runs (command_id, started_at, duration_ms, exit_code, by, command_text, cwd, output, truncated,
+                               session_id, env_json, pid, pgid, log_path, finished)
+             VALUES (?1, ?2, 0, NULL, ?3, ?4, ?5, '', 0, ?6, ?7, ?8, ?9, ?10, 0)",
             params![
                 command_id,
                 ts(&r.started_at),
-                r.duration_ms,
-                r.exit_code,
                 r.by,
                 r.command_text,
                 r.cwd,
-                r.output,
-                r.truncated as i64,
                 r.session_id,
-                serde_json::to_string(&r.env)?
+                serde_json::to_string(&r.env)?,
+                r.pid,
+                r.pgid,
+                r.log_path
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn finish_run(&self, run_id: i64, duration_ms: i64, exit_code: Option<i32>, output: &str, truncated: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET duration_ms = ?2, exit_code = ?3, output = ?4, truncated = ?5, finished = 1 WHERE id = ?1",
+            params![run_id, duration_ms, exit_code, output, truncated as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Runs not finished yet, oldest first, with their command's name.
+    pub fn unfinished_runs(&self) -> Result<Vec<(String, Run)>> {
+        let sql = format!(
+            "SELECT {RUN_COLS}, '', r.truncated, r.env_json, c.name
+             FROM runs r JOIN commands c ON c.id = r.command_id WHERE r.finished = 0 ORDER BY r.started_at, r.id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(14)?, run_from_row(row)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Recent runs, newest first. Output is only loaded when `with_output`.
@@ -333,9 +375,7 @@ impl Store {
              FROM runs r WHERE r.command_id = ?1 ORDER BY r.started_at DESC, r.id DESC LIMIT ?2"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![command_id, limit as i64], |row| {
-            run_from_row(row, row.get(7)?, row.get::<_, i64>(8)? != 0, &row.get::<_, String>(9)?)
-        })?;
+        let rows = stmt.query_map(params![command_id, limit as i64], run_from_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -415,10 +455,7 @@ impl Store {
              WHERE r.session_id = ?1 ORDER BY r.started_at, r.id"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([session_id], |row| {
-            let run = run_from_row(row, row.get(7)?, row.get::<_, i64>(8)? != 0, &row.get::<_, String>(9)?)?;
-            Ok((row.get::<_, String>(10)?, run))
-        })?;
+        let rows = stmt.query_map([session_id], |row| Ok((row.get::<_, String>(14)?, run_from_row(row)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 

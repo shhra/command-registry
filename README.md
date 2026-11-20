@@ -23,8 +23,18 @@ to it with the `/cr-register` skill.
 ## Install
 
 ```bash
-./install.sh     # cargo install + copies the skill to ~/.claude/skills/cr-register
+./install.sh     # cargo install of the cr binary
 ```
+
+The Claude side is the `cr` plugin in `plugin/`: the `cr:cr-register` skill
+plus a Bash guard that sends long runs through `cr run --detach` instead of
+nohup/setsid/pkill/`&`. Install it once, at the prompt of a Claude Code session:
+
+```
+/plugin install cr --marketplace shhra/command-registry
+```
+
+Answer `y` to add the marketplace, then pick the user scope.
 
 ## Use
 

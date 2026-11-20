@@ -34,6 +34,7 @@ struct Detail {
 
 struct App {
     store: Store,
+    db: std::path::PathBuf,
     sessions: Vec<Session>,
     /// None: every command; Some(i): sessions[i]'s commands, in order
     scope: Option<usize>,
@@ -48,9 +49,10 @@ struct App {
     quit: bool,
 }
 
-pub fn run(store: Store, session: Option<String>) -> Result<()> {
+pub fn run(store: Store, session: Option<String>, db: std::path::PathBuf) -> Result<()> {
     let mut app = App {
         store,
+        db,
         sessions: vec![],
         scope: None,
         all: vec![],
@@ -245,8 +247,9 @@ impl App {
     fn run_selected(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         let Some(cmd) = self.selected().cloned() else { return Ok(()) };
         let store = &self.store;
+        let db = self.db.clone();
         let result = suspended(terminal, || {
-            let r = runner::run(store, &cmd, &[], "user");
+            let r = runner::run(store, &cmd, &[], "user", &db, false);
             if let Err(e) = &r {
                 eprintln!("\x1b[31mcr: {e:#}\x1b[0m");
             }
@@ -345,6 +348,7 @@ impl App {
             .map(|&i| {
                 let c = &self.all[i];
                 let (mark, color) = match &c.last_run {
+                    Some(r) if !r.finished => ("●", Color::Yellow),
                     Some(r) if r.exit_code == Some(0) => ("✓", Color::Green),
                     Some(_) => ("✗", Color::Red),
                     None => ("·", Color::DarkGray),

@@ -1,0 +1,1 @@
+{ "name": "cr", "version": "0.1.0", "description": "Command registry: main runs go through cr sessions and cr run, never nohup/setsid/pkill or wrapper scripts" }

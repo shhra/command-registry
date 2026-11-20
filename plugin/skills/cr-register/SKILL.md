@@ -47,6 +47,23 @@ what ran, with which variables, in which order (`cr session log`).
   the whole transcript (env, cwd, command line, exit, output) oldest first.
   In the TUI, `s` cycles the session scope and `H` opens its transcript.
 
+## Long runs: `--detach`, never a wrapper
+
+A run that outlives a few minutes (training, pipelines, benchmarks) is
+started with `cr run <name> --by claude --detach`. cr starts itself in a new
+session, so the run survives the agent or terminal that launched it; it
+records the run the moment it starts (`cr ps` shows it, the TUI marks it ●)
+and finishes the same row with the exit when it ends. Never wrap `cr run` in
+`setsid`/`nohup`/`&`/redirects, and never stop a run with `kill`/`pkill`:
+
+- `cr ps`: runs in progress (run id, pid, process group, elapsed, log)
+- `cr tail <name>`: follow its log live (every run writes one)
+- `cr stop <name>`: SIGTERM to the run's process group, SIGKILL after `--grace`
+  seconds; the registry records `exit signal`
+
+To be notified when a detached run ends, watch its log for the final
+`exit … logged to registry` line (e.g. a Monitor on `cr tail <name>`).
+
 ## Steps
 
 1. **Check for an existing entry** with `cr list` (`cr session list` for
@@ -137,7 +154,10 @@ CR_SESSION=NAME cr                   the TUI scoped to the session
 ```
 cr                         open the TUI (Enter run · / filter · o full log · d delete · q quit)
 cr add NAME --cmd '…' …    register or update
-cr run NAME [--by claude] [-- extra args]
+cr run NAME [--by claude] [--detach] [-- extra args]
+cr ps                      runs in progress
+cr tail NAME               follow the latest run's log
+cr stop NAME [--grace S]   stop the run in progress (its process group)
 cr list [--json]           most recently used first
 cr show NAME [--json]      details + recent runs
 cr log NAME [-n N]         output of the Nth most recent run

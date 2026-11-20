@@ -219,6 +219,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "libc",
  "ratatui",
  "regex",
  "rusqlite",

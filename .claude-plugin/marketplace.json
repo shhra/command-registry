@@ -1,0 +1,11 @@
+{
+  "name": "command-registry",
+  "owner": { "name": "shhra" },
+  "plugins": [
+    {
+      "name": "cr",
+      "source": "./plugin",
+      "description": "Command registry: main runs go through cr sessions and cr run, never nohup/setsid/pkill or wrapper scripts"
+    }
+  ]
+}
